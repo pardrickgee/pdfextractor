@@ -37,6 +37,14 @@ def detect_section(page) -> str:
     if "kontakter" in top: return "contacts"
     return "unknown"
 
+def looks_like_contacts(page) -> bool:
+    t = (page.extract_text() or "").lower()
+    return ("# navn" in t and "rolle" in t) or ("navn firma" in t and "telefon" in t)
+
+def looks_like_projects(page) -> bool:
+    t = (page.extract_text() or "").lower()
+    return ("projektnavn" in t and "budget" in t) or ("bygn" in t and "stadie" in t)
+
 def normalize_header(row: List[str], expected: List[str]) -> List[str]:
     r = [clean(c) for c in row]
     out = []
@@ -198,8 +206,21 @@ async def extract(
         contacts_raw: List[Dict[str, Any]] = []
 
         with pdfplumber.open(io.BytesIO(data)) as pdf:
+            current_section = None
+
             for page in pdf.pages:
                 section = detect_section(page)
+
+                if section == "unknown":
+                    if looks_like_contacts(page):
+                        section = "contacts"
+                    elif looks_like_projects(page):
+                        section = "projects"
+                    elif current_section:
+                        section = current_section
+
+                if section != "unknown":
+                    current_section = section
 
                 if "projects" in which_set and section == "projects":
                     chunks = extract_tables_from_page(page, PROJECT_COLS)
