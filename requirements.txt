@@ -1,4 +1,5 @@
-afastapi
+fastapi
 uvicorn[standard]
 pdfplumber
+
 python-multipart
