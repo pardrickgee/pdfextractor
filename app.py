@@ -1,31 +1,42 @@
-from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
-import pdfplumber, io, re, os
+import pdfplumber, io, re
+from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="Byggefakta PDF Extractor")
-
-API_KEY = os.getenv("API_KEY")
+app = FastAPI(title="PDF Extractor")
 
 PROJECT_COLS = ["#", "Projektnavn", "Roller", "Region",
                 "Budget, kr.", "Byggestart", "Bæredygtighed",
                 "Seneste opdateringsdato", "Stadie"]
 CONTACT_COLS = ["#", "Navn", "Firma / Navn", "Telefon", "Rolle"]
 
-def clean(x): return re.sub(r"\s+", " ", x).strip() if x else ""
+def clean(x: Optional[str]) -> str:
+    if x is None: return ""
+    return re.sub(r"\s+", " ", str(x)).strip()
 
 def table_settings():
-    return dict(vertical_strategy="text", horizontal_strategy="text",
-                snap_tolerance=3, join_tolerance=3, edge_min_length=3,
-                keep_blank_chars=False, text_tolerance=2,
-                intersection_tolerance=3, min_words_horizontal=2, min_words_vertical=2)
+    return dict(vertical_strategy="text", horizontal_strategy="text")
 
-def detect_section(page):
-    t = (page.extract_text() or "")[:400].lower()
-    if "projekter" in t: return "projects"
-    if "kontakter" in t: return "contacts"
+def detect_section(page) -> str:
+    text = (page.extract_text() or "").lower()
+    if "projekter" in text: return "projects"
+    if "kontakter" in text: return "contacts"
     return "unknown"
 
-def normalize_header(row, expected):
-    r = [clean(c) for c in row]
-    r = [c.replace(" ,", ",").replace("Firma/ Navn", "Firma / Navn") for c in r]
-    if len(r) < len(expected): r += [""] * (len(expected)*
+@app.post("/extract")
+async def extract(file: UploadFile = File(...), which: str = Form("projects,contacts")):
+    content = await file.read()
+    projects, contacts = [], []
+    which_set = set(which.split(","))
+
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            section = detect_section(page)
+            if "projects" in which_set and section == "projects":
+                text = page.extract_text() or ""
+                projects.append({"page": page.page_number, "text": text})
+            elif "contacts" in which_set and section == "contacts":
+                text = page.extract_text() or ""
+                contacts.append({"page": page.page_number, "text": text})
+
+    return JSONResponse({"ok": True, "projects": projects, "contacts": contacts})
