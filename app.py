@@ -15,12 +15,13 @@ PROJECT_COLS = ["#", "Projektnavn", "Roller", "Region",
 
 CONTACT_COLS = ["#", "Navn", "Firma / Navn", "Telefon", "Rolle"]
 
+# ---------- helpers ----------
 def clean(s: Optional[str]) -> str:
     if s is None: return ""
     return re.sub(r"\s+", " ", str(s)).strip()
 
 def table_settings():
-    # Keep args compatible with current pdfplumber on Railway
+    # Compatible with pdfplumber on Railway
     return dict(
         vertical_strategy="text",
         horizontal_strategy="text",
@@ -43,13 +44,13 @@ def looks_like_contacts(page) -> bool:
 
 def looks_like_projects(page) -> bool:
     t = (page.extract_text() or "").lower()
-    return ("projektnavn" in t and "budget" in t) or ("bygn" in t and "stadie" in t)
+    return ("projektnavn" in t and "budget" in t) or ("region" in t and "stadie" in t)
 
 def normalize_header(row: List[str], expected: List[str]) -> List[str]:
     r = [clean(c) for c in row]
     out = []
     for c in r:
-        c = c.replace(" ,", ",").replace("Firma/ Navn","Firma / Navn")
+        c = c.replace(" ,", ",").replace("Firma/ Navn", "Firma / Navn")
         out.append(c)
     if len(out) < len(expected):
         out += [""] * (len(expected) - len(out))
@@ -57,7 +58,7 @@ def normalize_header(row: List[str], expected: List[str]) -> List[str]:
 
 def extract_tables_from_page(page, expected_header: List[str]) -> List[List[List[str]]]:
     w, h = page.width, page.height
-    content = page.crop((0, 0.07*h, w, h))  # trim top band
+    content = page.crop((0, 0.07*h, w, h))  # trim top band with page title
 
     tables = content.extract_tables(table_settings()) or []
     cleaned = []
@@ -75,6 +76,7 @@ def extract_tables_from_page(page, expected_header: List[str]) -> List[List[List
                 break
 
         if header_idx == -1:
+            # tolerate chunks without header; keep rows starting with index
             body = [r for r in t if r and re.match(r"^\d+(\.|)$", r[0])]
             if body:
                 cleaned.append([expected_header] + body)
@@ -96,7 +98,7 @@ def merge_to_dicts(chunks: List[List[List[str]]], expected_header: List[str]) ->
             rows.append({k: clean(v) for k, v in zip(expected_header, r)})
     return rows
 
-# -------- Projects post-processing --------
+# ---------- projects ----------
 def post_projects(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
@@ -111,10 +113,10 @@ def post_projects(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(key); uniq.append(r)
     return uniq
 
-# -------- Contacts post-processing (company omitted) --------
+# ---------- contacts (company omitted) ----------
 def post_contacts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Merge multi-line contact rows and return minimal schema:
+    Merge multi-line rows and return schema:
     { "#", "Navn", "Telefon1", "Telefon2", "TelefonExtra", "Rolle" }
     """
     COMPANY_TOKENS = {"ncc", "danmark", "a/s", "as", "a.s.", "a-s", "a", "s", "a/s,"}
@@ -129,30 +131,41 @@ def post_contacts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return " ".join(keep)
 
     def find_phones(*texts: str) -> List[str]:
-        # Danish-style 8-digit numbers
+        # Danish-style 8-digit numbers (allow linebreak merges)
         nums = re.findall(r"\b\d{8}\b", " ".join(t for t in texts if t))
+        # de-dup preserving order
         seen, out = set(), []
         for n in nums:
             if n not in seen:
                 seen.add(n); out.append(n)
         return out
 
+    def normalize_role(text: str) -> str:
+        t = clean(text)
+        # ensure a space after dots like "Projektleder." -> "Projektleder. "
+        t = re.sub(r"\.(?=[A-Za-zÆØÅæøå])", ". ", t)
+        return clean(t)
+
     def merge_buffer(buf: Dict[str, str]) -> Dict[str, str]:
         # Build Navn from 'Navn' + any surname that slipped into 'Firma / Navn' (but drop company tokens)
         name_core = clean(buf.get("Navn", ""))
         firm_bits = strip_company_tokens(clean(buf.get("Firma / Navn", "")))
         # If firm_bits looks like a name fragment, append it
-        if firm_bits and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ.\- ]+", firm_bits):
+        if firm_bits and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ.'\- ]+", firm_bits):
             name = f"{name_core} {firm_bits}".strip()
         else:
             name = name_core
 
-        phones = find_phones(buf.get("Telefon", ""), buf.get("Firma / Navn", ""), buf.get("Navn", ""))
+        # Phones: look across all fields in the merged buffer
+        phones = find_phones(buf.get("Telefon", ""),
+                             buf.get("Firma / Navn", ""),
+                             buf.get("Navn", ""),
+                             buf.get("Rolle", ""))
         tel1 = phones[0] if len(phones) > 0 else ""
         tel2 = phones[1] if len(phones) > 1 else ""
         tel_extra = ", ".join(phones[2:]) if len(phones) > 2 else ""
 
-        rolle = clean(buf.get("Rolle", ""))
+        rolle = normalize_role(buf.get("Rolle", ""))
 
         result = {
             "#": clean(buf.get("#", "")),
@@ -169,7 +182,7 @@ def post_contacts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buf: Dict[str, str] = {}
 
     for r in rows:
-        # New row starts when '#' is an integer; otherwise continuation
+        # New logical row when '#' is an integer; otherwise continuation
         if r.get("#") and re.fullmatch(r"\d+", r["#"]):
             if buf:
                 merged.append(merge_buffer(buf))
@@ -185,6 +198,7 @@ def post_contacts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     return merged
 
+# ---------- routes ----------
 @app.get("/healthz")
 def health():
     return {"ok": True}
@@ -206,11 +220,12 @@ async def extract(
         contacts_raw: List[Dict[str, Any]] = []
 
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            current_section = None
+            current_section = None  # remember last detected section
 
             for page in pdf.pages:
                 section = detect_section(page)
 
+                # fallback heuristics for continuation pages
                 if section == "unknown":
                     if looks_like_contacts(page):
                         section = "contacts"
@@ -234,9 +249,7 @@ async def extract(
 
         if projects:
             projects = post_projects(projects)
-        contacts = []
-        if contacts_raw:
-            contacts = post_contacts(contacts_raw)
+        contacts = post_contacts(contacts_raw) if contacts_raw else []
 
         return JSONResponse({
             "ok": True,
