@@ -1,0 +1,4 @@
+afastapi
+uvicorn[standard]
+pdfplumber
+python-multipart

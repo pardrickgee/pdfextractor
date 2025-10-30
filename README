@@ -1,0 +1,54 @@
+🧾 PDF Extractor API (for n8n + Google Drive automation)
+
+A lightweight FastAPI microservice for extracting structured text or tables from consistent PDF templates — like Byggefakta / NCC project sheets — using pdfplumber.
+
+It’s designed to be hosted for free on Railway.app
+ and easily connected to your n8n workflows (also running on Railway).
+
+🚀 Features
+
+🧠 Extracts text and table sections from specific PDF templates (e.g., PROJEKTER & KONTAKTER).
+
+⚡ Simple POST /extract endpoint for direct upload or n8n integration.
+
+🔒 Optional API key authentication.
+
+🧰 No external dependencies like Java or Ghostscript — runs fast and cheap.
+
+🪶 Deployable in under 2 minutes on Railway.
+
+🧩 Project structure
+pdf-extractor/
+│
+├── app.py               # FastAPI backend logic
+├── requirements.txt     # Python dependencies
+├── Procfile             # Railway start command
+└── README.md            # (this file)
+
+🧠 How it works
+
+You send a PDF file to:
+
+POST /extract
+
+
+with multipart/form-data containing:
+
+file → the PDF upload
+
+which → "projects,contacts" (optional filter)
+
+Example JSON response:
+
+{
+  "ok": true,
+  "projects": [
+    {"page": 1, "text": "Project 1 ..."}
+  ],
+  "contacts": [
+    {"page": 6, "text": "Contact: John Doe ..."}
+  ]
+}
+
+
+You can later replace the simple extractor with a smarter version that parses tables or exports CSVs.
