@@ -20,18 +20,17 @@ def clean(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 def table_settings():
+    # Compatible with current pdfplumber on Railway
     return dict(
         vertical_strategy="text",
         horizontal_strategy="text",
         snap_tolerance=3,
         join_tolerance=3,
         edge_min_length=3,
-        keep_blank_chars=False,
         text_tolerance=2,
         intersection_tolerance=3,
-        min_words_horizontal=2,
-        min_words_vertical=2
     )
+
 
 def detect_section(page) -> str:
     top = (page.extract_text() or "")[:600].lower()
@@ -166,3 +165,4 @@ async def extract(
         print(traceback.format_exc())
         # return readable error to the client (Swagger)
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
