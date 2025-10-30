@@ -1,255 +1,331 @@
-# app_fixed.py - Final fixed extraction for NCC PDF with proper role boundaries
-from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException
-from fastapi.responses import JSONResponse
-from typing import List, Dict, Any, Optional
-import io, os, re, traceback
-import pdfplumber
+#!/usr/bin/env python3
+# app_refactor.py — robust, layout-agnostic Smart Byggefakta scraper
+# Usage:
+#   python app_refactor.py input1.pdf input2.pdf -o output.json
+#
+# Requires: pdfplumber (`pip install pdfplumber`)
+# Optional: pytesseract/layoutparser for advanced table detection (not required for base run)
 
-app = FastAPI(title="PDF Extractor - Fixed")
+from pathlib import Path
+import sys
+import json
+import re
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Any, Optional, Tuple
 
-API_KEY = os.getenv("API_KEY")
+try:
+    import pdfplumber
+except Exception as e:
+    pdfplumber = None
+    PDFPLUMBER_IMPORT_ERROR = str(e)
+else:
+    PDFPLUMBER_IMPORT_ERROR = None
 
-# Expected column headers
-PROJECT_COLS = [
-    "#", "Projektnavn", "Roller", "Region",
-    "Budget, kr.", "Byggestart", "Bæredygtighed",
-    "Seneste opdateringsdato", "Stadie"
+# -----------------------------
+# Config
+# -----------------------------
+
+SECTION_PATTERNS = [
+    r"\\bKONTAKTER\\b", r"\\bKONTAKT\\b",
+    r"\\bPROJEKTER\\b", r"\\bPROJEKT\\b",
+    r"\\bUDBUD\\b",
+    r"\\bOPLYSNINGER\\b", r"\\bFAKTA\\b", r"\\bBESKRIVELSE\\b"
 ]
 
-CONTACT_COLS = ["#", "Navn", "Firma / Navn", "Telefon", "Rolle"]
+PHONE_RE = re.compile(r"(?:\\+45\\s*)?\\b\\d{2}\\s?\\d{2}\\s?\\d{2}\\s?\\d{2}\\b")
+EMAIL_RE = re.compile(r"\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b")
 
-# --- Helper functions --------------------------------------------------------
+# x/y tolerances in points
+X_ALIGN_TOL = 8
+Y_LINE_TOL = 3
+ROW_GAP_TOL = 8
+ALIGN_RATIO_MIN = 0.7
 
-def is_contact_page(page_text: str) -> bool:
-    """Check if this page contains contact information"""
-    text_lower = page_text.lower()
-    return (
-        "kontakter" in text_lower or
-        ("navn" in text_lower and "firma" in text_lower and "telefon" in text_lower) or
-        ("alex andersen" in text_lower) or
-        ("allan lavrsen" in text_lower)
-    )
+BIN_WIDTH = 22
+MIN_BIN_COUNT = 6
 
-def is_project_page(page_text: str) -> bool:
-    """Check if this page contains project information"""
-    text_lower = page_text.lower()
-    return (
-        "projekter" in text_lower or
-        ("projektnavn" in text_lower and "budget" in text_lower) or
-        ("renovering" in text_lower and "mio" in text_lower and "stadie" in text_lower)
-    )
+# -----------------------------
+# Data models
+# -----------------------------
 
-def fix_danish_name(name: str) -> str:
-    """Fix common Danish name splitting issues"""
-    if not name:
-        return name
-    
-    # Specific fixes for names in this PDF
-    fixes = {
-        r'Ande\s*rsen': 'Andersen',
-        r'Lavr\s*sen': 'Lavrsen', 
-        r'Ka\s*mal': 'Kamal',
-        r'Sch\s*ö\s*nau': 'Schönau',
-        r'Eng\s*berg': 'Engberg',
-        r'Berg\s+Rasmussen': 'Berg Rasmussen',
-        r'Nørby\s+Hansen': 'Nørby Hansen',
-        r'Dam\s+Jensen': 'Dam Jensen',
-        r'Møller\s+Christensen': 'Møller Christensen',
-    }
-    
-    for pattern, replacement in fixes.items():
-        name = re.sub(pattern, replacement, name, flags=re.IGNORECASE)
-    
-    return name.strip()
+@dataclass
+class Contact:
+    name: str = ""
+    company: str = ""
+    phones: List[str] = field(default_factory=list)
+    emails: List[str] = field(default_factory=list)
+    roles: List[str] = field(default_factory=list)
+    raw_row: Dict[int, str] = field(default_factory=dict)
 
-def extract_contacts_fixed(pdf) -> List[Dict[str, str]]:
-    """
-    Extract contacts with proper role boundaries
-    """
-    all_contacts = []
-    
-    # Look specifically at pages 6-11 where contacts are located
-    for page_num in range(5, min(11, len(pdf.pages))):
-        page = pdf.pages[page_num]
-        text = page.extract_text() or ""
-        
-        # Skip if not a contact page
-        if not is_contact_page(text):
+@dataclass
+class ProjectRow:
+    title: str = ""
+    roles: List[str] = field(default_factory=list)
+    region: str = ""
+    budget_kr: str = ""
+    stage: str = ""
+    raw_row: Dict[int, str] = field(default_factory=dict)
+
+@dataclass
+class TenderRow:
+    title: str = ""
+    role: str = ""
+    contact: str = ""
+    first_docs_date: str = ""
+    bid_date: str = ""
+    raw_row: Dict[int, str] = field(default_factory=dict)
+
+@dataclass
+class ParsedDoc:
+    source_file: str
+    source_company: Optional[str] = None
+    contacts: List[Contact] = field(default_factory=list)
+    projects: List[ProjectRow] = field(default_factory=list)
+    tenders: List[TenderRow] = field(default_factory=list)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def _find_header(text: str) -> Optional[str]:
+    if not text:
+        return None
+    for pat in SECTION_PATTERNS:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            return m.group(0).upper()
+    return None
+
+def _xcenter(w: Dict[str, Any]) -> float:
+    return (w["x0"] + w["x1"]) / 2.0
+
+def _infer_column_spans(words: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    if not words:
+        return []
+    xs = sorted(_xcenter(w) for w in words)
+    if not xs:
+        return []
+    bins = {}
+    for x in xs:
+        b = int(x // BIN_WIDTH)
+        bins[b] = bins.get(b, 0) + 1
+    peak_bins = [b for b, c in bins.items() if c >= MIN_BIN_COUNT]
+    if not peak_bins:
+        top = sorted(bins.items(), key=lambda kv: kv[1], reverse=True)[:4]
+        peak_bins = [b for b, _ in top]
+    peak_bins = sorted(set(peak_bins))
+    merged = []
+    for b in peak_bins:
+        if not merged:
+            merged.append([b, b])
+        else:
+            if b <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([b, b])
+    spans = []
+    pad = BIN_WIDTH * 0.45
+    for b0, b1 in merged:
+        x_left = b0 * BIN_WIDTH - pad
+        x_right = (b1 + 1) * BIN_WIDTH + pad
+        spans.append((x_left, x_right))
+    spans.sort(key=lambda ab: ab[0])
+    return spans
+
+def _align_to_spans(words: List[Dict[str, Any]], spans: List[Tuple[float, float]], tol: float = X_ALIGN_TOL) -> bool:
+    if not spans or not words:
+        return False
+    total = len(words)
+    in_bins = 0
+    centers = [ (a+b)/2.0 for a,b in spans ]
+    for w in words:
+        xc = _xcenter(w)
+        if any(abs(xc - c) <= max(tol, BIN_WIDTH*0.4) for c in centers):
+            in_bins += 1
+    ratio = in_bins / max(1, total)
+    return ratio >= ALIGN_RATIO_MIN
+
+def _group_words_into_lines(words: List[Dict[str, Any]], y_tol: float = Y_LINE_TOL) -> List[List[Dict[str, Any]]]:
+    if not words:
+        return []
+    words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines = []
+    current = [words_sorted[0]]
+    for w in words_sorted[1:]:
+        if abs(w["top"] - current[-1]["top"]) <= y_tol:
+            current.append(w)
+        else:
+            lines.append(sorted(current, key=lambda t: t["x0"]))
+            current = [w]
+    lines.append(sorted(current, key=lambda t: t["x0"]))
+    return lines
+
+def _assign_line_to_columns(line: List[Dict[str, Any]], spans: List[Tuple[float, float]]) -> Dict[int, str]:
+    cols: Dict[int, List[str]] = {}
+    if not spans:
+        text = " ".join(w["text"] for w in line)
+        return {0: text}
+    centers = [ (a+b)/2.0 for a,b in spans ]
+    for w in line:
+        xc = _xcenter(w)
+        idx = min(range(len(centers)), key=lambda i: abs(xc - centers[i]))
+        cols.setdefault(idx, []).append(w["text"])
+    return {i: " ".join(tokens) for i, tokens in cols.items()}
+
+def _merge_lines_into_rows(lines: List[List[Dict[str, Any]]], spans: List[Tuple[float, float]]) -> List[Dict[int, str]]:
+    rows: List[Dict[int, str]] = []
+    current: Dict[int, str] = {}
+    last_y = None
+    for line in lines:
+        assigned = _assign_line_to_columns(line, spans)
+        assigned = {k: v.strip() for k, v in assigned.items() if v and v.strip()}
+        first_col_has_text = (0 in assigned and assigned[0].strip() != "")
+        y_top = min(w["top"] for w in line)
+        start_new = False
+        if not current:
+            start_new = True
+        elif first_col_has_text:
+            start_new = True
+        elif last_y is not None and (y_top - last_y) > ROW_GAP_TOL and assigned:
+            start_new = True
+        if start_new:
+            if current:
+                rows.append(current)
+            current = dict(assigned)
+        else:
+            for ci, txt in assigned.items():
+                if ci in current:
+                    current[ci] = (current[ci] + " " + txt).strip()
+                else:
+                    current[ci] = txt
+        last_y = y_top
+    if current:
+        rows.append(current)
+    return rows
+
+# -----------------------------
+# Section handlers
+# -----------------------------
+
+def _extract_contacts(rows: List[Dict[int, str]]) -> List[Contact]:
+    out: List[Contact] = []
+    for r in rows:
+        name = (r.get(0) or "").strip()
+        company = (r.get(1) or "").strip()
+        all_text = " | ".join(r.get(i, "") for i in sorted(r.keys()))
+        phones = sorted(set(PHONE_RE.findall(all_text)))
+        emails = sorted(set(EMAIL_RE.findall(all_text)))
+        rightmost_idx = max(r.keys())
+        rightmost_text = r.get(rightmost_idx, "")
+        roles = [s.strip(" .;:") for s in re.split(r"[\\n|/•]|  {2,}", rightmost_text) if s.strip()]
+        if not (name or company or phones or emails or roles):
             continue
-        
-        # Split into lines
-        lines = text.split('\n')
-        
-        # Process line by line
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            
-            # Check for contact start: number (1-3 digits) followed by name
-            match = re.match(r'^(\d{1,3})\s+([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå\-\.]+)*)', line)
-            
-            if match:
-                contact = {
-                    "#": match.group(1),
-                    "name": match.group(2),
-                    "phones": [],
-                    "role_lines": []
-                }
-                
-                # Extract phones from current line
-                contact["phones"] = re.findall(r'\b\d{8}\b', line)
-                
-                # Extract role from current line (after name and company)
-                rest_of_line = line[match.end():]
-                rest_of_line = re.sub(r'NCC\s*Danmark\s*A/?S', '', rest_of_line)
-                rest_of_line = re.sub(r'\b\d{8}\b', '', rest_of_line)
-                rest_of_line = rest_of_line.strip()
-                
-                # Only add if it contains role keywords
-                if any(kw in rest_of_line for kw in ['Projektleder', 'Kontaktperson', 'entreprenør', 'Entr.']):
-                    contact["role_lines"].append(rest_of_line)
-                
-                # Look at next lines for additional role/phone info
-                j = i + 1
-                while j < len(lines) and j <= i + 3:  # Only look 3 lines ahead max
-                    next_line = lines[j].strip()
-                    
-                    # STOP if we hit another contact (starts with 1-3 digit number and name)
-                    if re.match(r'^(\d{1,3})\s+[A-ZÆØÅ][a-zæøå]+\s+[A-ZÆØÅ]', next_line):
-                        break
-                    
-                    # STOP if we see another contact number in the line
-                    if re.search(r'\b\d{1,3}\s+[A-ZÆØÅ][a-zæøå]+\s+(NCC|Danmark)', next_line):
-                        break
-                    
-                    # Check if line starts with 8-digit phone
-                    if re.match(r'^(\d{8})\b', next_line):
-                        phone = re.match(r'^(\d{8})\b', next_line).group(1)
-                        if phone not in contact["phones"]:
-                            contact["phones"].append(phone)
-                        
-                        # Rest might be role
-                        rest = next_line[8:].strip()
-                        if rest and any(kw in rest for kw in ['Projektleder', 'entreprenør', 'Entr.']):
-                            contact["role_lines"].append(rest)
-                    
-                    # Check if it's a pure role line (contains role keywords)
-                    elif any(kw in next_line for kw in ['Projektleder', 'Kontaktperson', 
-                                                         'entreprenør', 'Entr.', 'Ingeniør']):
-                        # But make sure it doesn't contain another contact's info
-                        if not re.search(r'\b\d{1,3}\s+[A-ZÆØÅ]', next_line):
-                            contact["role_lines"].append(next_line)
-                    
-                    j += 1
-                
-                # Process the contact
-                contact["name"] = fix_danish_name(contact["name"])
-                
-                # Clean up role - join lines and remove duplicates
-                role = " ".join(contact["role_lines"])
-                role = re.sub(r'\s+', ' ', role)
-                
-                # Remove any accidental contact info from role
-                role = re.sub(r'\d{1,3}\s+[A-ZÆØÅ][a-zæøå]+\s+[A-ZÆØÅ][a-zæøå]+.*', '', role)
-                role = re.sub(r'NCC\s*Danmark\s*A/?S', '', role)
-                role = role.strip()
-                
-                all_contacts.append({
-                    "#": contact["#"],
-                    "Navn": contact["name"],
-                    "Telefon1": contact["phones"][0] if contact["phones"] else "",
-                    "Telefon2": contact["phones"][1] if len(contact["phones"]) > 1 else "",
-                    "Rolle": role
-                })
-                
-                i = j - 1  # Continue from where we stopped
-            
-            i += 1
-    
-    return all_contacts
+        out.append(Contact(name=name, company=company, phones=phones, emails=emails, roles=roles, raw_row=r))
+    return out
 
-def extract_projects_simple(pdf) -> List[Dict[str, Any]]:
-    """Simple project extraction"""
-    projects = []
-    
-    for page in pdf.pages:
-        page_text = page.extract_text() or ""
-        
-        # Skip if not a project page
-        if not is_project_page(page_text):
-            continue
-        
-        # Skip if this is a contact page
-        if is_contact_page(page_text):
-            continue
-        
-        # Extract tables
-        tables = page.extract_tables() or []
-        
-        for table in tables:
-            # Process each row
-            for row in table:
-                if not row:
-                    continue
-                
-                # Clean cells
-                row = [str(c).strip() if c else "" for c in row]
-                
-                # Check if this is a project row (starts with number)
-                if row[0] and re.match(r'^\d+$', row[0]):
-                    # Create project with available columns
-                    project = {
-                        "#": row[0],
-                        "Projektnavn": row[1] if len(row) > 1 else "",
-                        "Roller": row[2] if len(row) > 2 else "",
-                        "Region": row[3] if len(row) > 3 else "",
-                        "Budget, kr.": row[4] if len(row) > 4 else "",
-                        "Byggestart": row[5] if len(row) > 5 else "",
-                        "Bæredygtighed": row[6] if len(row) > 6 else "",
-                        "Seneste opdateringsdato": row[7] if len(row) > 7 else "",
-                        "Stadie": row[8] if len(row) > 8 else ""
-                    }
-                    projects.append(project)
-    
-    return projects
+def _extract_projects(rows: List[Dict[int, str]]) -> List[ProjectRow]:
+    out: List[ProjectRow] = []
+    for r in rows:
+        cells = [r.get(i, "") for i in sorted(r.keys())]
+        text = " | ".join(cells)
+        title = cells[0].strip() if cells else ""
+        region = ""
+        budget = ""
+        stage = ""
+        m = re.search(r"(\\d[\\d\\. ]+)\\s*(kr|DKK)", text, flags=re.I)
+        if m:
+            budget = m.group(0)
+        if re.search(r"(fase|stage|status)\\s*[:\\-]?\\s*(\\w+)", text, flags=re.I):
+            stage = re.sub(r".*?(fase|stage|status)\\s*[:\\-]?\\s*", "", text, flags=re.I)
+        out.append(ProjectRow(title=title, region=region, budget_kr=budget, stage=stage, raw_row=r))
+    return out
 
-# --- FastAPI routes ----------------------------------------------------------
+def _extract_tenders(rows: List[Dict[int, str]]) -> List[TenderRow]:
+    out: List[TenderRow] = []
+    for r in rows:
+        cells = [r.get(i, "") for i in sorted(r.keys())]
+        title = cells[0].strip() if cells else ""
+        role = cells[1].strip() if len(cells) > 1 else ""
+        contact = cells[2].strip() if len(cells) > 2 else ""
+        dates_text = " ".join(cells)
+        m1 = re.findall(r"\\b\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}\\b", dates_text)
+        first_docs_date = m1[0] if m1 else ""
+        bid_date = m1[1] if len(m1) > 1 else ""
+        out.append(TenderRow(title=title, role=role, contact=contact, first_docs_date=first_docs_date, bid_date=bid_date, raw_row=r))
+    return out
 
-@app.get("/healthz")
-def health():
-    return {"ok": True}
+# -----------------------------
+# Core parser
+# -----------------------------
 
-@app.post("/extract")
-async def extract(
-    file: UploadFile = File(...),
-    which: str = Form("projects,contacts"),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+def parse_pdf(path: str) -> ParsedDoc:
+    if pdfplumber is None:
+        raise RuntimeError(f"pdfplumber import failed: {PDFPLUMBER_IMPORT_ERROR}")
+    parsed = ParsedDoc(source_file=Path(path).name)
+    with pdfplumber.open(path) as pdf:
+        current_section: Optional[str] = None
+        current_spans: List[Tuple[float, float]] = []
+        for page in pdf.pages:
+            try:
+                text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+            except Exception:
+                text = ""
+            try:
+                words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+            except Exception:
+                words = []
+            header = _find_header(text)
+            if header:
+                current_section = header
+                current_spans = _infer_column_spans(words)
+            elif current_section and _align_to_spans(words, current_spans, tol=X_ALIGN_TOL):
+                pass
+            else:
+                current_section, current_spans = None, []
+            if not current_section:
+                continue
+            lines = _group_words_into_lines(words, y_tol=Y_LINE_TOL)
+            rows = _merge_lines_into_rows(lines, current_spans)
+            if "KONTAKT" in current_section:
+                parsed.contacts.extend(_extract_contacts(rows))
+            elif "PROJEKT" in current_section:
+                parsed.projects.extend(_extract_projects(rows))
+            elif "UDBUD" in current_section:
+                parsed.tenders.extend(_extract_tenders(rows))
+            else:
+                if not parsed.source_company and text:
+                    top_lines = "\\n".join(text.splitlines()[:8])
+                    m = re.search(r"^(?:Firma|Virksomhed|Company)\\s*[:\\-]\\s*(.+)$", top_lines, flags=re.I|re.M)
+                    if m:
+                        parsed.source_company = m.group(1).strip()
+    return parsed
 
-    try:
-        data = await file.read()
-        which_set = {w.strip().lower() for w in which.split(",") if w.strip()}
+# -----------------------------
+# CLI
+# -----------------------------
 
-        projects = []
-        contacts = []
+def main(argv: List[str]) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Smart Byggefakta PDF scraper (layout-agnostic, multi-page).")
+    parser.add_argument("inputs", nargs="+", help="One or more input PDF files")
+    parser.add_argument("-o", "--output", help="Write combined JSON to this file")
+    args = parser.parse_args(argv)
+    all_docs: List[ParsedDoc] = []
+    for path in args.inputs:
+        try:
+            doc = parse_pdf(path)
+            all_docs.append(doc)
+        except Exception as e:
+            all_docs.append(ParsedDoc(source_file=Path(path).name))
+            print(f"[WARN] Failed to parse {path}: {e}", file=sys.stderr)
+    payload = [asdict(d) for d in all_docs]
+    js = json.dumps(payload, ensure_ascii=False, indent=2)
+    if args.output:
+        Path(args.output).write_text(js, encoding="utf-8")
+        print(f"Wrote {args.output}")
+    else:
+        print(js)
+    return 0
 
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            if "projects" in which_set:
-                projects = extract_projects_simple(pdf)
-            
-            if "contacts" in which_set:
-                contacts = extract_contacts_fixed(pdf)
-
-        return JSONResponse({
-            "ok": True,
-            "counts": {"projects": len(projects), "contacts": len(contacts)},
-            "projects": projects,
-            "contacts": contacts
-        })
-
-    except Exception as e:
-        print("---- EXTRACT ERROR ----")
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
