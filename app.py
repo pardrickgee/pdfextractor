@@ -20,7 +20,7 @@ def clean(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 def table_settings():
-    # Compatible with current pdfplumber on Railway
+    # Keep args compatible with current pdfplumber on Railway
     return dict(
         vertical_strategy="text",
         horizontal_strategy="text",
@@ -30,7 +30,6 @@ def table_settings():
         text_tolerance=2,
         intersection_tolerance=3,
     )
-
 
 def detect_section(page) -> str:
     top = (page.extract_text() or "")[:600].lower()
@@ -56,7 +55,7 @@ def extract_tables_from_page(page, expected_header: List[str]) -> List[List[List
     cleaned = []
     for t in tables:
         t = [[clean(c) for c in row] for row in t if any(c and c.strip() for c in row)]
-        if not t: 
+        if not t:
             continue
 
         header_idx = -1
@@ -89,6 +88,7 @@ def merge_to_dicts(chunks: List[List[List[str]]], expected_header: List[str]) ->
             rows.append({k: clean(v) for k, v in zip(expected_header, r)})
     return rows
 
+# -------- Projects post-processing --------
 def post_projects(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
@@ -98,21 +98,83 @@ def post_projects(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen, uniq = set(), []
     for r in out:
         key = (r["#"], r["Projektnavn"])
-        if key in seen: 
+        if key in seen:
             continue
         seen.add(key); uniq.append(r)
     return uniq
 
+# -------- Contacts post-processing (company omitted) --------
 def post_contacts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    merged: List[Dict[str, Any]] = []
+    """
+    Merge multi-line contact rows and return minimal schema:
+    { "#", "Navn", "Telefon1", "Telefon2", "TelefonExtra", "Rolle" }
+    """
+    COMPANY_TOKENS = {"ncc", "danmark", "a/s", "as", "a.s.", "a-s", "a", "s", "a/s,"}
+
+    def strip_company_tokens(text: str) -> str:
+        parts = text.split()
+        keep = []
+        for p in parts:
+            if p.lower() in COMPANY_TOKENS:
+                continue
+            keep.append(p)
+        return " ".join(keep)
+
+    def find_phones(*texts: str) -> List[str]:
+        # Danish-style 8-digit numbers
+        nums = re.findall(r"\b\d{8}\b", " ".join(t for t in texts if t))
+        seen, out = set(), []
+        for n in nums:
+            if n not in seen:
+                seen.add(n); out.append(n)
+        return out
+
+    def merge_buffer(buf: Dict[str, str]) -> Dict[str, str]:
+        # Build Navn from 'Navn' + any surname that slipped into 'Firma / Navn' (but drop company tokens)
+        name_core = clean(buf.get("Navn", ""))
+        firm_bits = strip_company_tokens(clean(buf.get("Firma / Navn", "")))
+        # If firm_bits looks like a name fragment, append it
+        if firm_bits and re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ.\- ]+", firm_bits):
+            name = f"{name_core} {firm_bits}".strip()
+        else:
+            name = name_core
+
+        phones = find_phones(buf.get("Telefon", ""), buf.get("Firma / Navn", ""), buf.get("Navn", ""))
+        tel1 = phones[0] if len(phones) > 0 else ""
+        tel2 = phones[1] if len(phones) > 1 else ""
+        tel_extra = ", ".join(phones[2:]) if len(phones) > 2 else ""
+
+        rolle = clean(buf.get("Rolle", ""))
+
+        result = {
+            "#": clean(buf.get("#", "")),
+            "Navn": name,
+            "Telefon1": tel1,
+            "Telefon2": tel2,
+            "Rolle": rolle
+        }
+        if tel_extra:
+            result["TelefonExtra"] = tel_extra
+        return result
+
+    merged: List[Dict[str, str]] = []
+    buf: Dict[str, str] = {}
+
     for r in rows:
-        if r["#"] and re.match(r"^\d+$", r["#"]):
-            merged.append(r)
-        elif merged:
-            merged[-1]["Rolle"] = clean(merged[-1]["Rolle"] + " " + " ".join([
-                r.get("Navn",""), r.get("Firma / Navn",""),
-                r.get("Telefon",""), r.get("Rolle","")
-            ]))
+        # New row starts when '#' is an integer; otherwise continuation
+        if r.get("#") and re.fullmatch(r"\d+", r["#"]):
+            if buf:
+                merged.append(merge_buffer(buf))
+            buf = {k: clean(v) for k, v in r.items()}
+        else:
+            for k, v in r.items():
+                if not v:
+                    continue
+                buf[k] = (buf.get(k, "") + " " + clean(v)).strip()
+
+    if buf:
+        merged.append(merge_buffer(buf))
+
     return merged
 
 @app.get("/healthz")
@@ -133,7 +195,7 @@ async def extract(
         which_set = {w.strip().lower() for w in which.split(",") if w.strip()}
 
         projects: List[Dict[str, Any]] = []
-        contacts: List[Dict[str, Any]] = []
+        contacts_raw: List[Dict[str, Any]] = []
 
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             for page in pdf.pages:
@@ -147,10 +209,13 @@ async def extract(
                 if "contacts" in which_set and section == "contacts":
                     chunks = extract_tables_from_page(page, CONTACT_COLS)
                     if chunks:
-                        contacts += merge_to_dicts(chunks, CONTACT_COLS)
+                        contacts_raw += merge_to_dicts(chunks, CONTACT_COLS)
 
-        if projects: projects = post_projects(projects)
-        if contacts: contacts = post_contacts(contacts)
+        if projects:
+            projects = post_projects(projects)
+        contacts = []
+        if contacts_raw:
+            contacts = post_contacts(contacts_raw)
 
         return JSONResponse({
             "ok": True,
@@ -160,9 +225,6 @@ async def extract(
         })
 
     except Exception as e:
-        # log full traceback to Railway logs
         print("---- EXTRACT ERROR ----")
         print(traceback.format_exc())
-        # return readable error to the client (Swagger)
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
