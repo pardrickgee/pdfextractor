@@ -2,27 +2,24 @@
 from fastapi import FastAPI, File, Form, UploadFile, Header, HTTPException
 from fastapi.responses import JSONResponse
 from typing import List, Dict, Any, Optional
-import io, os, re
+import io, os, re, traceback
 import pdfplumber
 
 app = FastAPI(title="PDF Extractor")
 
-API_KEY = os.getenv("API_KEY")  # optional; set in Railway Variables
+API_KEY = os.getenv("API_KEY")  # optional
 
-# --- schema we expect on each section ---
 PROJECT_COLS = ["#", "Projektnavn", "Roller", "Region",
                 "Budget, kr.", "Byggestart", "Bæredygtighed",
                 "Seneste opdateringsdato", "Stadie"]
 
 CONTACT_COLS = ["#", "Navn", "Firma / Navn", "Telefon", "Rolle"]
 
-# ---------- utilities ----------
 def clean(s: Optional[str]) -> str:
     if s is None: return ""
     return re.sub(r"\s+", " ", str(s)).strip()
 
 def table_settings():
-    # heuristics tuned for the Byggefakta print layout (no ruled lines)
     return dict(
         vertical_strategy="text",
         horizontal_strategy="text",
@@ -53,9 +50,8 @@ def normalize_header(row: List[str], expected: List[str]) -> List[str]:
     return out[:len(expected)]
 
 def extract_tables_from_page(page, expected_header: List[str]) -> List[List[List[str]]]:
-    # crop off top header band where page title/date sits; it reduces false detections
     w, h = page.width, page.height
-    content = page.crop((0, 0.07*h, w, h))
+    content = page.crop((0, 0.07*h, w, h))  # trim top band
 
     tables = content.extract_tables(table_settings()) or []
     cleaned = []
@@ -64,7 +60,6 @@ def extract_tables_from_page(page, expected_header: List[str]) -> List[List[List
         if not t: 
             continue
 
-        # try to locate the header row inside first 4 rows
         header_idx = -1
         for i, row in enumerate(t[:4]):
             row_join = " ".join(row).lower()
@@ -74,7 +69,6 @@ def extract_tables_from_page(page, expected_header: List[str]) -> List[List[List
                 break
 
         if header_idx == -1:
-            # sometimes the header is omitted in a chunk; accept body rows that start with an index (#)
             body = [r for r in t if r and re.match(r"^\d+(\.|)$", r[0])]
             if body:
                 cleaned.append([expected_header] + body)
@@ -92,49 +86,39 @@ def merge_to_dicts(chunks: List[List[List[str]]], expected_header: List[str]) ->
     for tbl in chunks:
         header, *body = tbl
         for r in body:
-            # pad/trim to expected width
             r = (r + [""] * len(expected_header))[:len(expected_header)]
-            row = {k: clean(v) for k, v in zip(expected_header, r)}
-            rows.append(row)
+            rows.append({k: clean(v) for k, v in zip(expected_header, r)})
     return rows
 
 def post_projects(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
-        idx = re.sub(r"\D+$", "", r["#"])
-        r["#"] = idx
-        # normalize budget notations
+        r["#"] = re.sub(r"\D+$", "", r["#"])
         r["Budget, kr."] = r["Budget, kr."].replace(" mia.", " mia").replace(" mio.", " mio")
         out.append(r)
-
-    # de-duplicate across page splits
     seen, uniq = set(), []
     for r in out:
         key = (r["#"], r["Projektnavn"])
         if key in seen: 
             continue
-        seen.add(key)
-        uniq.append(r)
+        seen.add(key); uniq.append(r)
     return uniq
 
 def post_contacts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # merge continuation lines (where "#" column is empty)
     merged: List[Dict[str, Any]] = []
     for r in rows:
         if r["#"] and re.match(r"^\d+$", r["#"]):
             merged.append(r)
         elif merged:
-            # append overflow text into Role field (most common split)
             merged[-1]["Rolle"] = clean(merged[-1]["Rolle"] + " " + " ".join([
                 r.get("Navn",""), r.get("Firma / Navn",""),
                 r.get("Telefon",""), r.get("Rolle","")
             ]))
     return merged
 
-# ----------- API -------------
-@app.get("/")
+@app.get("/healthz")
 def health():
-    return {"ok": True, "service": "pdf-extractor"}
+    return {"ok": True}
 
 @app.post("/extract")
 async def extract(
@@ -142,36 +126,43 @@ async def extract(
     which: str = Form("projects,contacts"),
     x_api_key: Optional[str] = Header(default=None),
 ):
-    # optional auth
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    data = await file.read()
-    which_set = {w.strip().lower() for w in which.split(",") if w.strip()}
+    try:
+        data = await file.read()
+        which_set = {w.strip().lower() for w in which.split(",") if w.strip()}
 
-    projects: List[Dict[str, Any]] = []
-    contacts: List[Dict[str, Any]] = []
+        projects: List[Dict[str, Any]] = []
+        contacts: List[Dict[str, Any]] = []
 
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for page in pdf.pages:
-            section = detect_section(page)
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                section = detect_section(page)
 
-            if "projects" in which_set and section == "projects":
-                chunks = extract_tables_from_page(page, PROJECT_COLS)
-                if chunks:
-                    projects += merge_to_dicts(chunks, PROJECT_COLS)
+                if "projects" in which_set and section == "projects":
+                    chunks = extract_tables_from_page(page, PROJECT_COLS)
+                    if chunks:
+                        projects += merge_to_dicts(chunks, PROJECT_COLS)
 
-            if "contacts" in which_set and section == "contacts":
-                chunks = extract_tables_from_page(page, CONTACT_COLS)
-                if chunks:
-                    contacts += merge_to_dicts(chunks, CONTACT_COLS)
+                if "contacts" in which_set and section == "contacts":
+                    chunks = extract_tables_from_page(page, CONTACT_COLS)
+                    if chunks:
+                        contacts += merge_to_dicts(chunks, CONTACT_COLS)
 
-    if projects: projects = post_projects(projects)
-    if contacts: contacts = post_contacts(contacts)
+        if projects: projects = post_projects(projects)
+        if contacts: contacts = post_contacts(contacts)
 
-    return JSONResponse({
-        "ok": True,
-        "counts": {"projects": len(projects), "contacts": len(contacts)},
-        "projects": projects if "projects" in which_set else [],
-        "contacts": contacts if "contacts" in which_set else []
-    })
+        return JSONResponse({
+            "ok": True,
+            "counts": {"projects": len(projects), "contacts": len(contacts)},
+            "projects": projects if "projects" in which_set else [],
+            "contacts": contacts if "contacts" in which_set else []
+        })
+
+    except Exception as e:
+        # log full traceback to Railway logs
+        print("---- EXTRACT ERROR ----")
+        print(traceback.format_exc())
+        # return readable error to the client (Swagger)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
