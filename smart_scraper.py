@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Production Smart Byggefakta PDF Scraper
-Uses Camelot for robust table extraction from layout-based PDFs
+Improved Smart Byggefakta PDF Scraper
+Better filtering and data quality validation
 """
 
 from pathlib import Path
@@ -35,10 +35,17 @@ DANISH_DATE_PATTERN = re.compile(
     r'september|oktober|november|december)\s+\d{4}\b', re.I
 )
 
-# Keywords for table classification
-CONTACT_INDICATORS = ['navn', 'telefon', 'email', 'rolle', 'kontakt', 'firma']
-PROJECT_INDICATORS = ['projekt', 'budget', 'region', 'byggestart', 'stadie']
-TENDER_INDICATORS = ['udbud', 'licitationsdato', 'udbudsrolle']
+# Section headers to skip
+SECTION_HEADERS = {'kontakter', 'projekter', 'udbud', 'oplysninger', 'arkiv'}
+
+# Common role/type indicators that should NOT be names
+ROLE_KEYWORDS = {
+    'entr.', 'entr', 'entreprenør', 'totalentreprenør', 'hovedentreprenør',
+    'element', 'stål', 'beton', 'tømrer', 'snedker', 'el-entreprenør',
+    'vvs', 'jord/kloak', 'fundering', 'belægning', 'facade', 'gulv',
+    'tagdækning', 'vindue', 'døre', 'maler', 'privat', 'firma',
+    'telefon', 'fax', 'e-mail', 'hjemmeside', 'cvr', 'rolle', 'navn'
+}
 
 # ========================================
 # Data Models
@@ -121,6 +128,142 @@ def split_multiline(text: str) -> List[str]:
     parts = re.split(r'[\n•|]|  {2,}', clean_text(text))
     return [p.strip() for p in parts if p.strip()]
 
+def is_header_row(row_text: str) -> bool:
+    """Check if row is a table header"""
+    row_lower = row_text.lower().strip()
+    
+    # Check for section headers
+    if row_lower in SECTION_HEADERS:
+        return True
+    
+    # Check for common header patterns
+    header_patterns = [
+        r'^navn\s*$',
+        r'^telefon\s*$',
+        r'^rolle\s*$',
+        r'^firma.*navn',
+        r'^projekt.*navn',
+        r'^region\s*$',
+        r'^budget\s*$',
+        r'^#\s*$'
+    ]
+    
+    for pattern in header_patterns:
+        if re.search(pattern, row_lower):
+            return True
+    
+    return False
+
+def is_role_type_only(text: str) -> bool:
+    """Check if text is just a role/type indicator, not a person/project name"""
+    text_lower = text.lower().strip()
+    
+    # Check against role keywords
+    for keyword in ROLE_KEYWORDS:
+        if text_lower == keyword or text_lower.endswith(keyword):
+            return True
+    
+    # Check if it's ONLY a role type (no actual name content)
+    role_only_patterns = [
+        r'^[A-Za-z/\-]+\s+entr\.?\s*$',
+        r'^entr\.?\s*$',
+        r'^element\s*$',
+        r'^stål\s*$',
+        r'^beton\s*$'
+    ]
+    
+    for pattern in role_only_patterns:
+        if re.search(pattern, text_lower, re.I):
+            return True
+    
+    return False
+
+def is_valid_contact(contact: Contact) -> bool:
+    """Validate if contact has enough meaningful data"""
+    # Must have a name
+    if not contact.name or len(contact.name) < 2:
+        return False
+    
+    # Name should not be a header or role keyword
+    if is_header_row(contact.name) or is_role_type_only(contact.name):
+        return False
+    
+    # Filter out row numbers
+    if contact.name.isdigit():
+        return False
+    
+    # Filter out company info field labels
+    info_labels = ['id nr', 'firmatype', 'telefonnummer', 'e-mail adresse', 
+                   'hjemmeside', 'cvr nr', 'fax']
+    name_lower = contact.name.lower().strip()
+    if any(label in name_lower for label in info_labels):
+        return False
+    
+    # Must have at least one piece of contact info or company
+    has_info = (
+        contact.phones or 
+        contact.emails or 
+        (contact.company and len(contact.company) > 3 and not is_role_type_only(contact.company))
+    )
+    
+    if not has_info:
+        return False
+    
+    # Check for garbage patterns
+    garbage_patterns = ['fax:', 'e-mail', 'telefon:', 'hjemmeside:', 'privat', 'cvr']
+    name_lower = contact.name.lower()
+    if any(g in name_lower for g in garbage_patterns):
+        return False
+    
+    # Name should have at least one letter (not just numbers/symbols)
+    if not any(c.isalpha() for c in contact.name):
+        return False
+    
+    return True
+
+def is_valid_project(project: Project) -> bool:
+    """Validate if project has enough meaningful data"""
+    # Must have a name
+    if not project.name or len(project.name) < 5:
+        return False
+    
+    # Name should not be a header or section title
+    if is_header_row(project.name):
+        return False
+    
+    # Name should not be just a role type
+    if is_role_type_only(project.name):
+        return False
+    
+    # Must have at least 2 other fields (region, budget, or dates)
+    fields_filled = sum([
+        bool(project.region),
+        bool(project.budget),
+        bool(project.start_date),
+        bool(project.stage)
+    ])
+    
+    if fields_filled < 2:
+        return False
+    
+    return True
+
+def is_valid_tender(tender: Tender) -> bool:
+    """Validate if tender has enough meaningful data"""
+    # Must have a name
+    if not tender.name or len(tender.name) < 5:
+        return False
+    
+    # Name should not be a header
+    if is_header_row(tender.name):
+        return False
+    
+    # Must have at least role or contact
+    if not tender.role and not tender.contact:
+        return False
+    
+    return True
+
 # ========================================
 # Table Classification
 # ========================================
@@ -139,8 +282,7 @@ def classify_table(df: pd.DataFrame) -> str:
         ' '.join(df.iloc[i].astype(str)) for i in range(sample_rows)
     ).lower()
     
-    # Direct section detection - use more specific patterns
-    # Check contacts first since it's more specific
+    # Direct section detection
     if re.search(r'\bkontakter\b', sample) or (re.search(r'\bnavn\b', sample) and re.search(r'\btelefon\b', sample)):
         return 'contacts'
     
@@ -237,7 +379,7 @@ def merge_continuation_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def extract_contacts_from_df(df: pd.DataFrame) -> List[Contact]:
-    """Extract contacts from DataFrame"""
+    """Extract contacts from DataFrame with improved filtering"""
     contacts = []
     
     debug_print(f"Processing {len(df)} contact rows")
@@ -248,61 +390,78 @@ def extract_contacts_from_df(df: pd.DataFrame) -> List[Contact]:
     
     # Find where data actually starts (skip section title and headers)
     data_start = 0
-    for i in range(min(5, len(df))):
+    for i in range(min(10, len(df))):
         row_text = ' '.join(df.iloc[i].astype(str)).lower()
-        # Skip rows with section titles or column headers
-        if any(x in row_text for x in ['kontakter', 'kontakt', '#', 'navn', 'telefon', 'rolle']):
+        if is_header_row(row_text):
             data_start = i + 1
             continue
-        break
+        # If we found a row with actual name-like content, start here
+        if len(row_text) > 5 and not is_header_row(row_text):
+            break
     
     debug_print(f"Data starts at row {data_start}")
     
     for idx in range(data_start, len(df)):
         row = df.iloc[idx]
+        row_list = [clean_text(str(cell)) for cell in row]
+        
+        # Skip empty rows
+        if not any(cell for cell in row_list if cell and cell != 'nan'):
+            continue
+        
+        # Skip if first column looks like a header or section
+        if row_list and is_header_row(row_list[0]):
+            continue
         
         contact = Contact()
         
-        # Get all non-empty cells
-        cells = [clean_text(str(cell)) for cell in row if clean_text(str(cell)) and clean_text(str(cell)) != 'nan']
-        if not cells:
-            continue
+        # Extract name - skip first column if it's just a number (row number)
+        name_start_col = 0
+        if row_list and row_list[0].isdigit():
+            name_start_col = 1  # Skip row number column
         
-        # Concatenate all for pattern matching
-        full_text = ' | '.join(cells)
+        # Extract name from appropriate column
+        for i in range(name_start_col, min(len(row_list), 3)):
+            cell = row_list[i]
+            if cell and cell != 'nan' and not is_role_type_only(cell):
+                # Check if this looks like a name (not a phone, email, or role indicator)
+                if not PHONE_PATTERN.match(cell) and not EMAIL_PATTERN.match(cell):
+                    # Additional check: should have at least 2 parts (first + last name)
+                    # or be longer than just initials
+                    if ' ' in cell or len(cell) > 5:
+                        contact.name = cell
+                        break
         
-        # Extract structured data
+        # Extract company
+        # Look for company name (usually in first few columns, contains A/S or ApS)
+        for i in range(name_start_col, min(len(row_list), 4)):
+            cell = row_list[i]
+            if cell and cell != 'nan' and cell != contact.name:
+                # Check if it looks like a company
+                if 'A/S' in cell or 'ApS' in cell or (len(cell) > 10 and not is_role_type_only(cell)):
+                    contact.company = cell
+                    break
+        
+        # Extract all phones and emails from entire row
+        full_text = ' | '.join(row_list)
         contact.phones = extract_phones(full_text)
         contact.emails = extract_emails(full_text)
         
-        # Parse based on expected column structure (#, Name, Company, Phone, Role)
-        row_list = [clean_text(str(cell)) for cell in row]
+        # Extract roles from cells that look like roles
+        for cell in row_list:
+            if cell and cell != 'nan' and cell not in [contact.name, contact.company]:
+                # Check if this cell contains role keywords
+                cell_lower = cell.lower()
+                if any(role in cell_lower for role in ['projektleder', 'kontaktperson', 'indkøber', 'byggeleder', 'entr']):
+                    parts = split_multiline(cell)
+                    contact.roles.extend(parts)
         
-        # Column 0: ID (skip)
-        # Column 1: Name
-        if len(row_list) > 1:
-            name = row_list[1]
-            if name and name != 'nan' and not name.isdigit():
-                contact.name = name
-        
-        # Column 2: Company
-        if len(row_list) > 2:
-            company = row_list[2]
-            if company and company != 'nan' and len(company) > 3:
-                contact.company = company
-        
-        # Column 3: Phone (already extracted via regex)
-        
-        # Column 4: Roles
-        if len(row_list) > 4:
-            roles_text = row_list[4]
-            if roles_text and roles_text != 'nan':
-                contact.roles = split_multiline(roles_text)
-        
-        # Only keep if we have a name or meaningful contact info
-        if contact.name or contact.phones or contact.emails:
+        # Validate and add
+        if is_valid_contact(contact):
             contacts.append(contact)
-            debug_print(f"  ✓ {contact.name} - {contact.company} - {len(contact.phones)} phones, {len(contact.roles)} roles")
+            debug_print(f"  ✓ {contact.name} - {contact.company or '(no company)'}")
+        else:
+            debug_print(f"  ✗ Filtered out: {contact.name}", "WARN")
     
     return contacts
 
@@ -311,72 +470,99 @@ def extract_contacts_from_df(df: pd.DataFrame) -> List[Contact]:
 # ========================================
 
 def extract_projects_from_df(df: pd.DataFrame) -> List[Project]:
-    """Extract projects from DataFrame"""
+    """Extract projects from DataFrame with improved filtering"""
     projects = []
     
     debug_print(f"Processing {len(df)} project rows")
     
-    # Find where data actually starts
+    # First, merge continuation rows
+    df = merge_continuation_rows(df)
+    debug_print(f"After merging continuations: {len(df)} rows")
+    
+    # Find where data starts
     data_start = 0
-    for i in range(min(5, len(df))):
+    for i in range(min(10, len(df))):
         row_text = ' '.join(df.iloc[i].astype(str)).lower()
-        if any(x in row_text for x in ['projekter', 'projektnavn', 'budget', 'region', '#']):
+        if is_header_row(row_text):
             data_start = i + 1
             continue
-        break
+        if len(row_text) > 10:
+            break
     
     debug_print(f"Data starts at row {data_start}")
     
+    seen_projects = set()  # Track duplicates
+    
     for idx in range(data_start, len(df)):
         row = df.iloc[idx]
+        row_list = [clean_text(str(cell)) for cell in row]
+        
+        # Skip empty rows
+        if not any(cell for cell in row_list if cell and cell != 'nan'):
+            continue
+        
+        # Skip if row looks like headers
+        row_text = ' '.join(row_list)
+        if is_header_row(row_text):
+            continue
         
         project = Project()
         
-        cells = [clean_text(str(cell)) for cell in row if clean_text(str(cell))]
-        if not cells:
+        # Extract project name (first substantial cell that's not a role type)
+        for cell in row_list:
+            if cell and cell != 'nan' and len(cell) > 5:
+                if not is_role_type_only(cell):
+                    project.name = cell
+                    break
+        
+        # Skip if no valid name found
+        if not project.name:
             continue
         
-        full_text = ' | '.join(cells)
+        # Skip duplicates
+        if project.name in seen_projects:
+            debug_print(f"  ✗ Duplicate: {project.name}", "WARN")
+            continue
         
-        # First cell is usually project name (or row number + name)
-        if cells:
-            # Skip if first cell is just a number
-            if cells[0].isdigit() and len(cells) > 1:
-                project.name = cells[1]
-            else:
-                project.name = cells[0]
+        # Extract other fields
+        full_text = ' | '.join(row_list)
         
-        # Extract money
+        # Region (look for specific regions)
+        regions = ['hovedstaden', 'sjælland', 'syddanmark', 'midtjylland', 'nordjylland']
+        for region in regions:
+            if region in full_text.lower():
+                project.region = region.capitalize()
+                break
+        
+        # Budget (look for money)
         project.budget = extract_money(full_text)
         
-        # Find region
-        regions = ['hovedstaden', 'sjælland', 'syddanmark', 'midtjylland', 'nordjylland']
-        for cell in cells:
-            if any(r in cell.lower() for r in regions):
-                project.region = cell
+        # Dates
+        danish_dates = DANISH_DATE_PATTERN.findall(full_text)
+        if danish_dates:
+            project.start_date = danish_dates[0]
+        
+        # Stage (look for common stage keywords)
+        stage_keywords = ['udførelsesproces', 'projektering', 'idéfase', 'afsluttet']
+        for stage in stage_keywords:
+            if stage in full_text.lower():
+                project.stage = stage.capitalize()
                 break
         
-        # Find stage/status
-        stages = ['udbudsproces', 'udførelsesproces', 'projekteringsproces']
-        for cell in cells:
-            if any(s in cell.lower() for s in stages):
-                project.stage = cell
-                break
+        # Roles (extract any role-like text)
+        for cell in row_list:
+            if cell and cell != 'nan' and cell != project.name:
+                if any(role in cell.lower() for role in ['entr', 'projektleder', 'kontaktperson']):
+                    parts = split_multiline(cell)
+                    project.roles.extend(parts)
         
-        # Extract dates
-        dates = DANISH_DATE_PATTERN.findall(full_text)
-        if dates:
-            project.start_date = dates[0]
-        
-        # Look for roles (contains "entreprenør")
-        for cell in cells:
-            if 'entreprenør' in cell.lower() or len(cell) > 30:
-                project.roles = split_multiline(cell)
-                break
-        
-        if project.name and len(project.name) > 3 and not project.name.isdigit():
+        # Validate and add
+        if is_valid_project(project):
             projects.append(project)
-            debug_print(f"  ✓ {project.name[:60]}... [{project.budget}]")
+            seen_projects.add(project.name)
+            debug_print(f"  ✓ {project.name[:60]}... - {project.budget} - {project.region}")
+        else:
+            debug_print(f"  ✗ Filtered out: {project.name[:60]}", "WARN")
     
     return projects
 
@@ -385,7 +571,7 @@ def extract_projects_from_df(df: pd.DataFrame) -> List[Project]:
 # ========================================
 
 def extract_tenders_from_df(df: pd.DataFrame) -> List[Tender]:
-    """Extract tenders from DataFrame"""
+    """Extract tenders from DataFrame with improved filtering"""
     tenders = []
     
     debug_print(f"Processing {len(df)} tender rows")
@@ -396,22 +582,27 @@ def extract_tenders_from_df(df: pd.DataFrame) -> List[Tender]:
     
     # Find where data starts
     data_start = 0
-    for i in range(min(5, len(df))):
+    for i in range(min(10, len(df))):
         row_text = ' '.join(df.iloc[i].astype(str)).lower()
-        if any(x in row_text for x in ['udbud', 'udbudsnavn', 'rolle', 'kontakt', '#']):
+        if is_header_row(row_text):
             data_start = i + 1
             continue
-        break
+        if len(row_text) > 10:
+            break
     
     debug_print(f"Data starts at row {data_start}")
     
     for idx in range(data_start, len(df)):
         row = df.iloc[idx]
-        
         row_list = [clean_text(str(cell)) for cell in row]
         
         # Skip empty rows
         if not any(cell for cell in row_list if cell and cell != 'nan'):
+            continue
+        
+        # Skip if row looks like headers
+        row_text = ' '.join(row_list)
+        if is_header_row(row_text):
             continue
         
         tender = Tender()
@@ -419,7 +610,7 @@ def extract_tenders_from_df(df: pd.DataFrame) -> List[Tender]:
         # Expected columns: #, Udbudsnavn, Udbudsrolle, Projektnavn, Kontakt, Første dag, Licitationsdato
         if len(row_list) > 1:
             name = row_list[1]
-            if name and name != 'nan' and not name.isdigit():
+            if name and name != 'nan' and not name.isdigit() and len(name) > 5:
                 tender.name = name
         
         if len(row_list) > 2:
@@ -429,7 +620,7 @@ def extract_tenders_from_df(df: pd.DataFrame) -> List[Tender]:
         
         if len(row_list) > 3:
             project = row_list[3]
-            if project and project != 'nan':
+            if project and project != 'nan' and len(project) > 5:
                 tender.project_name = project
         
         if len(row_list) > 4:
@@ -444,9 +635,12 @@ def extract_tenders_from_df(df: pd.DataFrame) -> List[Tender]:
             tender.docs_date = dates[0] if len(dates) > 0 else ""
             tender.bid_date = dates[1] if len(dates) > 1 else ""
         
-        if tender.name:
+        # Validate and add
+        if is_valid_tender(tender):
             tenders.append(tender)
             debug_print(f"  ✓ {tender.name[:60]}... - {tender.role}")
+        else:
+            debug_print(f"  ✗ Filtered out: {tender.name[:40] if tender.name else '(no name)'}", "WARN")
     
     return tenders
 
@@ -486,7 +680,7 @@ def extract_company_info_from_text(text: str) -> CompanyInfo:
         if len(line) < 3 or line.lower() in ['oplysninger', 'smart', 'byggefakta']:
             continue
         # Company name usually has certain patterns
-        if len(line) > 5 and len(line) < 50 and 'A/S' in line or 'ApS' in line:
+        if len(line) > 5 and len(line) < 50 and ('A/S' in line or 'ApS' in line):
             info.name = line
             break
     
@@ -508,14 +702,13 @@ def parse_pdf(pdf_path: str) -> ParsedDocument:
     
     try:
         # Extract all tables from all pages using 'stream' flavor
-        # (for tables without clear borders)
         debug_print("Extracting tables with Camelot (stream mode)...")
         tables = camelot.read_pdf(
             pdf_path,
             pages='all',
             flavor='stream',
-            edge_tol=50,  # Tolerance for edge detection
-            row_tol=10,   # Tolerance for row detection
+            edge_tol=50,
+            row_tol=10,
         )
         
         debug_print(f"Found {len(tables)} tables across all pages")
@@ -551,13 +744,10 @@ def parse_pdf(pdf_path: str) -> ParsedDocument:
         
         # Extract company info from first page
         try:
-            first_page_text = camelot.read_pdf(pdf_path, pages='1', flavor='stream')
-            if first_page_text:
-                # Get text from first table or use pdfplumber for text extraction
-                import pdfplumber
-                with pdfplumber.open(pdf_path) as pdf:
-                    first_text = pdf.pages[0].extract_text() or ""
-                    doc.company_info = extract_company_info_from_text(first_text)
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                first_text = pdf.pages[0].extract_text() or ""
+                doc.company_info = extract_company_info_from_text(first_text)
         except Exception as e:
             debug_print(f"Could not extract company info: {e}", "WARN")
     
@@ -586,8 +776,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Smart Byggefakta PDF Scraper (Production Version)',
-        epilog='Example: python smart_scraper.py file1.pdf file2.pdf -o output.json'
+        description='Improved Smart Byggefakta PDF Scraper',
+        epilog='Example: python smart_scraper_improved.py file1.pdf -o output.json'
     )
     
     parser.add_argument('files', nargs='+', help='PDF file(s) to parse')
