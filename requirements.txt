@@ -1,5 +1,9 @@
-fastapi
-uvicorn[standard]
-pdfplumber
+# PDF Processing
+camelot-py[cv]>=1.0.0
+pandas>=2.0.0
+pdfplumber>=0.10.0
 
-python-multipart
+# FastAPI and server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
